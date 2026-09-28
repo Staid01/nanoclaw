@@ -214,8 +214,11 @@ With Iron Proxy, setup grants both the model credential and any account header
 to this installation’s principal. It reconciles the destination allowlist without
 installing OneCLI or reading `ONECLI_URL` / `ONECLI_API_KEY`. Native model domains
 and the configured HTTPS model host belong to OpenCode’s provider contract.
-Iron endpoints must use HTTPS on port 443 with a DNS hostname, including keyless
-self-hosted models; put TLS in front of a plaintext local server first.
+
+The selected gateway may limit which model endpoints it can reach. The
+local-endpoint prompt shows the gateway's reason and asks again, and setup stops
+on an exported `OPENCODE_BASE_URL` the gateway refuses. The gateway's skill
+explains how to serve a local model through it.
 
 With the OneCLI gateway selected, grant the group’s OneCLI agent access to the chosen secret.
 Read its existing secret assignments first and merge the new secret ID into that

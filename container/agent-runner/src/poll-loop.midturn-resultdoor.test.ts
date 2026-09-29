@@ -2,7 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './mailbox/sqlite/connection.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
-import { processQuery } from './poll-loop.js';
+import { processQuery, runPollLoop } from './poll-loop.js';
+import { MockProvider } from './providers/mock.js';
 import type { AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
 
 // Adversarial verification of the one-door contract for mid-turn delivery
@@ -553,6 +554,13 @@ describe('cross-segment echo guard', () => {
 
 // ── MCP sends count as same-turn deliveries for the nudge decision ──
 
+// The delivered-reply check is shared by both delivery modes, so the rules
+// for what counts as a reply are pinned for each.
+const PROVIDER_MODES: Array<[string, boolean]> = [
+  ['mid-turn-provider', true],
+  ['result-provider', false],
+];
+
 describe('DB-visible sends gate the nudge', () => {
   it('a chat row written this turn outside the door (MCP send_message shape) suppresses the nudge', async () => {
     seedDest();
@@ -579,6 +587,149 @@ describe('DB-visible sends gate the nudge', () => {
 
     expect(deliveredTexts()).toEqual(['sent via tool']);
     expect(nudges(pushes)).toHaveLength(0);
+  });
+
+  it('suppresses the nudge for a result-door provider too, so a tool send is not repeated', async () => {
+    seedDest();
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      const { writeMessageOut } = await import('./db/messages-out.js');
+      writeMessageOut({
+        id: 'mcp-1',
+        kind: 'chat',
+        platform_id: 'chan-1',
+        channel_type: 'discord',
+        thread_id: null,
+        content: JSON.stringify({ text: 'sent via tool' }),
+      });
+      // No mid-turn door here: the reply already went out via the tool, so
+      // the unwrapped closing prose must not trigger a duplicate re-send.
+      yield { type: 'result', text: 'Told them via the tool.' };
+    }
+    const { query, pushes } = makeStubQuery(events());
+
+    await processQuery(query, CHAT_ROUTING, ['m1'], 'result-provider', undefined, 'prompt', undefined, false);
+
+    expect(deliveredTexts()).toEqual(['sent via tool']);
+    expect(nudges(pushes)).toHaveLength(0);
+  });
+
+  it.each(PROVIDER_MODES)(
+    'a reaction alone does not count as a reply: the unwrapped answer is still nudged (%s)',
+    async (provider, midTurn) => {
+      seedDest();
+      async function* events(): AsyncGenerator<ProviderEvent> {
+        yield { type: 'init', continuation: 's1' };
+        const { writeMessageOut } = await import('./db/messages-out.js');
+        writeMessageOut({
+          id: 'react-1',
+          kind: 'chat',
+          platform_id: 'chan-1',
+          channel_type: 'discord',
+          thread_id: null,
+          content: JSON.stringify({ operation: 'reaction', messageId: 'p-1', emoji: 'eyes' }),
+        });
+        yield { type: 'result', text: 'The answer is 4.' };
+      }
+      const { query, pushes } = makeStubQuery(events());
+
+      await processQuery(query, CHAT_ROUTING, ['m1'], provider, undefined, 'prompt', undefined, midTurn);
+
+      expect(nudges(pushes)).toHaveLength(1);
+    },
+  );
+
+  it.each(PROVIDER_MODES)(
+    'a delegation send to another agent does not count as the user reply (%s)',
+    async (provider, midTurn) => {
+      seedDest();
+      async function* events(): AsyncGenerator<ProviderEvent> {
+        yield { type: 'init', continuation: 's1' };
+        const { writeMessageOut } = await import('./db/messages-out.js');
+        writeMessageOut({
+          id: 'a2a-1',
+          kind: 'chat',
+          platform_id: 'ag-worker',
+          channel_type: 'agent',
+          thread_id: null,
+          content: JSON.stringify({ text: 'Check the arithmetic.' }),
+        });
+        yield { type: 'result', text: 'The answer is 4.' };
+      }
+      const { query, pushes } = makeStubQuery(events());
+
+      await processQuery(query, CHAT_ROUTING, ['m1'], provider, undefined, 'prompt', undefined, midTurn);
+
+      expect(nudges(pushes)).toHaveLength(1);
+    },
+  );
+
+  it.each(PROVIDER_MODES)(
+    'on an agent wake, a tool send back to the agent is the reply (%s)',
+    async (provider, midTurn) => {
+      seedDest();
+      async function* events(): AsyncGenerator<ProviderEvent> {
+        yield { type: 'init', continuation: 's1' };
+        const { writeMessageOut } = await import('./db/messages-out.js');
+        writeMessageOut({
+          id: 'a2a-1',
+          kind: 'chat',
+          platform_id: 'ag-caller',
+          channel_type: 'agent',
+          thread_id: null,
+          content: JSON.stringify({ text: 'Done.' }),
+        });
+        yield { type: 'result', text: 'Replied via the tool.' };
+      }
+      const { query, pushes } = makeStubQuery(events());
+      const agentRouting = { ...CHAT_ROUTING, platformId: 'ag-caller', channelType: 'agent', agentOnly: true };
+
+      await processQuery(query, agentRouting, ['m1'], provider, undefined, 'prompt', undefined, midTurn);
+
+      expect(nudges(pushes)).toHaveLength(0);
+    },
+  );
+
+  it.each(PROVIDER_MODES)(
+    'a batch led by an agent row but carrying a user row: an a2a send is not the user reply (%s)',
+    async (provider, midTurn) => {
+      seedDest();
+      async function* events(): AsyncGenerator<ProviderEvent> {
+        yield { type: 'init', continuation: 's1' };
+        const { writeMessageOut } = await import('./db/messages-out.js');
+        writeMessageOut({
+          id: 'a2a-1',
+          kind: 'chat',
+          platform_id: 'ag-worker',
+          channel_type: 'agent',
+          thread_id: null,
+          content: JSON.stringify({ text: 'Check the arithmetic.' }),
+        });
+        yield { type: 'result', text: 'The answer is 4.' };
+      }
+      const { query, pushes } = makeStubQuery(events());
+      // extractRouting of [agent row, user row]: routing follows the first row,
+      // but the batch is not agent-only.
+      const mixedRouting = { ...CHAT_ROUTING, platformId: 'ag-worker', channelType: 'agent', agentOnly: false };
+
+      await processQuery(query, mixedRouting, ['m1'], provider, undefined, 'prompt', undefined, midTurn);
+
+      expect(nudges(pushes)).toHaveLength(1);
+    },
+  );
+
+  it('still nudges a result-door provider whose turn delivered nothing', async () => {
+    seedDest();
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield { type: 'result', text: 'The answer is 4.' };
+    }
+    const { query, pushes } = makeStubQuery(events());
+
+    await processQuery(query, CHAT_ROUTING, ['m1'], 'result-provider', undefined, 'prompt', undefined, false);
+
+    expect(deliveredTexts()).toEqual([]);
+    expect(nudges(pushes)).toHaveLength(1);
   });
 });
 
@@ -628,5 +779,76 @@ describe('capability=true keeps base result-door handling for door-skipped block
 
     expect(deliveredTexts()).toEqual([]);
     expect(nudges(pushes)).toHaveLength(1);
+  });
+});
+
+// ── Runner commands in the batch do not decide who is owed a reply ──
+
+/** Answers the first prompt with an a2a tool send and unwrapped closing prose; records later pushes. */
+class AgentReplyProvider extends MockProvider {
+  pushes: string[] = [];
+  query(): AgentQuery {
+    const pushes = this.pushes;
+    let aborted = false;
+    let wake: (() => void) | null = null;
+    return {
+      push: (m: string) => {
+        pushes.push(m);
+        wake?.();
+      },
+      end: () => {},
+      abort: () => {
+        aborted = true;
+        wake?.();
+      },
+      events: (async function* (): AsyncGenerator<ProviderEvent> {
+        yield { type: 'init', continuation: 's1' };
+        const { writeMessageOut } = await import('./db/messages-out.js');
+        writeMessageOut({
+          id: 'a2a-reply',
+          kind: 'chat',
+          platform_id: 'ag-caller',
+          channel_type: 'agent',
+          thread_id: null,
+          content: JSON.stringify({ text: 'Done.' }),
+        });
+        yield { type: 'result', text: 'Replied via the tool.' };
+        while (!aborted) await new Promise<void>((r) => (wake = r));
+      })(),
+    };
+  }
+}
+
+describe('runner commands in the batch', () => {
+  it.each([
+    ['mid-turn-provider', 'mid-turn-complete'],
+    ['result-provider', 'result'],
+  ] as const)('a /clear riding with an agent request does not nudge the a2a reply (%s)', async (name, textDelivery) => {
+    const insert = getInboundDb().prepare(
+      `INSERT INTO messages_in (id, seq, kind, timestamp, status, platform_id, channel_type, content)
+       VALUES (?, ?, 'chat', datetime('now'), 'pending', ?, ?, ?)`,
+    );
+    insert.run('m-clear', 2, 'chan-1', 'discord', JSON.stringify({ sender: 'Alice', text: '/clear' }));
+    insert.run('m-agent', 4, 'ag-caller', 'agent', JSON.stringify({ sender: 'caller', text: 'Status?' }));
+    const provider = new AgentReplyProvider();
+    const controller = new AbortController();
+    const loop = runPollLoop({
+      provider,
+      providerContract: { textDelivery, commands: { formatting: 'xml' } },
+      providerName: name,
+      cwd: '/tmp',
+      signal: controller.signal,
+    });
+
+    const deadline = Date.now() + 3000;
+    while (!getUndeliveredMessages().some((m) => m.id === 'a2a-reply')) {
+      if (Date.now() > deadline) throw new Error('a2a reply never written');
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    await new Promise((r) => setTimeout(r, 300)); // let the result dispatch run
+    controller.abort();
+    await loop.catch(() => {});
+
+    expect(nudges(provider.pushes)).toHaveLength(0);
   });
 });
